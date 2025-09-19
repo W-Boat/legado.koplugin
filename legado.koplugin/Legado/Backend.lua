@@ -137,22 +137,43 @@ local function pDownload_CreateCBZ(filePath, img_sources)
     local cbz_path_tmp = filePath .. '.downloading'
 
     if util.fileExists(cbz_path_tmp) then
-        if M:isExtractingInBackground() == true then
+        if M:getBackgroundTaskInfo() ~= false then
             error("Other threads downloading, cancelled")
         else
             util.removeFile(cbz_path_tmp)
         end
     end
 
-    local ZipWriter = require("ffi/zipwriter")
+    local cbz
+    local cbz_lib
+    local no_compression
+    local mtime
 
-    local cbz = ZipWriter:new{}
-    if not cbz:open(cbz_path_tmp) then
-        error('CreateCBZ cbz:open err')
+    -- 20250525 PR # 2090: Archive.Writer replaces ZipWriter
+    local ok , ZipWriter = pcall(require, "ffi/zipwriter")
+    if ok and ZipWriter then
+        cbz_lib = "zipwriter"
+        no_compression = true
+
+        cbz = ZipWriter:new{}
+        if not cbz:open(cbz_path_tmp) then
+            error('CreateCBZ cbz:open err')
+        end
+        cbz:add("mimetype", "application/vnd.comicbook+zip", true)
+    else
+        cbz_lib = "archiver"
+        mtime = os.time()
+
+        local Archiver = require("ffi/archiver").Writer
+        cbz = Archiver:new{}
+        if not cbz:open(cbz_path_tmp, "epub") then
+            error(string.format("CreateCBZ cbz:open err: %s", tostring(cbz.err)))
+        end
+
+        cbz:setZipCompression("store")
+        cbz:addFileFromMemory("mimetype", "application/vnd.comicbook+zip", mtime)
+        cbz:setZipCompression("deflate")
     end
-    cbz:add("mimetype", "application/vnd.comicbook+zip", true)
-
-    local no_compression = true
 
     for i, img_src in ipairs(img_sources) do
 
@@ -181,15 +202,20 @@ local function pDownload_CreateCBZ(filePath, img_sources)
                 imgdata = imgdata_new.data
             end
 
-            cbz:add(img_name, imgdata, no_compression)
+            if cbz_lib == "zipwriter" then
+                cbz:add(img_name, imgdata, no_compression)
+            else
+                cbz:addFileFromMemory(img_name, imgdata, mtime)
+            end
 
         else
             dbg.v('Download_Image err', tostring(err))
         end
         ::continue::
     end
-
-    cbz:close()
+    if cbz and cbz.close then
+        cbz:close()
+    end
     dbg.v('CreateCBZ cbz:close')
 
     if util.fileExists(filePath) ~= true then
@@ -297,8 +323,13 @@ function M:initialize()
             reader3_un = '',
             reader3_pwd = '',
             servers_history = {},
+            web_configs = {},
+            current_config_id = nil,
             stream_image_view = nil,
-            disable_browser = nil
+            disable_browser = nil,
+            sync_reading = nil,
+            open_at_last_read = nil,
+            custom_css_path = nil,
         }
         self.settings_data:flush()
     end
@@ -309,6 +340,9 @@ function M:initialize()
     self.dbManager = BookInfoDB:new({
         dbPath = H.getTempDirectory() .. "/bookinfo.db"
     })
+
+    -- 验证自定义CSS文件是否仍然存在
+    self:validateCustomCSS()
 
 end
 
@@ -344,14 +378,9 @@ function M:checkOta(is_compel)
     end
 end
 
-function M:show_notice(msg, timeout)
+function M:_show_notice(msg, timeout)
     local Notification = require("ui/widget/notification")
     Notification:notify(msg or '', Notification.SOURCE_ALWAYS_SHOW)
-end
-function M:launchProcess(job)
-    if H.is_func(job) then
-        return ffiUtil.runInSubProcess(job, nil ,true)
-    end
 end
 function M:getLuaConfig(path)
     return LuaSettings:open(path)
@@ -1475,7 +1504,7 @@ local txt2html = function(book_cache_id, content, title)
 end
 
 local htmlparser
-function M:_AnalyzingChapters(chapter, content)
+function M:_AnalyzingChapters(chapter, content, filePath)
 
     local bookUrl = chapter.bookUrl
     local book_cache_id = chapter.book_cache_id
@@ -1483,12 +1512,9 @@ function M:_AnalyzingChapters(chapter, content)
     local chapter_title = chapter.title or ''
     local down_chapters_index = chapter.chapters_index
 
-    if type(content) ~= "string" then
-        content = tostring(content)
-    end
-
-    local filePath = H.getChapterCacheFilePath(book_cache_id, chapters_index, chapter.name)
-
+    content = H.is_str(content) and content or tostring(content)
+    filePath = filePath or H.getChapterCacheFilePath(book_cache_id, chapters_index, chapter.name)
+ 
     local first_line = string.match(content, "([^\n]*)\n?") or content
     local PAGE_TYPES = {
         TEXT = 1, -- 纯文本
@@ -1721,7 +1747,7 @@ function M:_AnalyzingChapters(chapter, content)
 
 end
 
-function M:pDownloadChapter(chapter, message_dialog, is_recursive)
+function M:_pDownloadChapter(chapter, message_dialog, is_recursive)
 
     local bookUrl = chapter.bookUrl
     local book_cache_id = chapter.book_cache_id
@@ -1738,10 +1764,10 @@ function M:pDownloadChapter(chapter, message_dialog, is_recursive)
     end
 
     if bookUrl == nil or not book_cache_id then
-        error('pDownloadChapter input parameters err' .. tostring(bookUrl) .. tostring(book_cache_id))
+        error('_pDownloadChapter input parameters err' .. tostring(bookUrl) .. tostring(book_cache_id))
     end
 
-    local cache_chapter = self:getCacheChapterFilePath(chapter)
+    local cache_chapter = self:getCacheChapterFilePath(chapter, true)
     if cache_chapter and cache_chapter.cacheFilePath then
         return cache_chapter
     end
@@ -1751,17 +1777,18 @@ function M:pDownloadChapter(chapter, message_dialog, is_recursive)
     if is_recursive ~= true and H.is_tbl(response) and response.type == 'ERROR' and
         string.find(tostring(response.message), 'NEED_LOGIN', 1, true) then
         self:resetReader3Token()
-        self:pDownloadChapter(chapter, message_dialog, true)
+        return self:_pDownloadChapter(chapter, message_dialog, true)
     end
 
     if not H.is_tbl(response) or response.type ~= 'SUCCESS' then
-        error(response.message or '章节下载失败')
+        error((response and response.message) or '章节下载失败')
     end
 
     return self:_AnalyzingChapters(chapter, response.body)
 end
 
-function M:getCacheChapterFilePath(chapter)
+-- write_to_db, run in subprocess, no DB writes allowed
+function M:getCacheChapterFilePath(chapter, not_write_db)
 
     if not H.is_tbl(chapter) or chapter.book_cache_id == nil or chapter.chapters_index == nil then
         dbg.log('getCacheChapterFilePath parameters err:', chapter)
@@ -1780,9 +1807,11 @@ function M:getCacheChapterFilePath(chapter)
             return chapter
         else
             dbg.v('Files are deleted, clear database record flag', cache_file_path)
-            pcall(function()
-                self.dbManager:updateCacheFilePath(chapter, false)
-            end)
+            if not not_write_db then
+                pcall(function()
+                    self.dbManager:updateCacheFilePath(chapter, false)
+                end)
+            end
             chapter.cacheFilePath = nil
         end
     end
@@ -1964,223 +1993,132 @@ function M:getChapterImgList(chapter)
     end)
 end
 
-function M:DownAllChapter(chapters)
-    local begin_chapter = chapters[1]
+function M:preLoadingChapters(chapter, download_chapter_count, result_progress_callback)
 
-    begin_chapter.call_event = 'next'
-
-    local status, err = self:preLoadingChapters(begin_chapter, #chapters)
-    if not status then
-        return wrap_response(nil, tostring(err))
-    else
-        return wrap_response(err)
+    local has_result_progress_callback = H.is_func(result_progress_callback)
+    local return_error_handle = function(error_msg)
+        error_msg = error_msg or "未知错误"
+        logger.dbg("Legado.preLoadingChapters - ", error_msg)
+        if has_result_progress_callback then
+            has_result_progress_callback(false, error_msg)
+        else
+            return false, error_msg
+        end
     end
-end
-
-function M:preLoadingChapters(chapter, download_chapter_count)
 
     if not H.is_tbl(chapter) then
-        return false, 'preLoadingChaptersIncorrect call parameters'
+        return return_error_handle('Incorrect call parameters')
     end
 
-    if self:isExtractingInBackground() == true then
-        dbg.log('"Background tasks incomplete. Cannot create new tasks:"')
-        return false, "Background tasks incomplete. Cannot create new tasks:"
-    end
-
-    if not H.is_num(download_chapter_count) or download_chapter_count < 1 then
-        download_chapter_count = 1
+    if self:getBackgroundTaskInfo() ~= false then
+        return return_error_handle("Cannot create new tasks.")
     end
 
     local chapter_down_tasks = {}
 
-    if chapter[1] and chapter[1].chapters_index ~= nil and chapter[1].book_cache_id ~= nil then
-
+    -- Support passing multiple chapters directly
+    if H.is_tbl(chapter[1]) and chapter[1].chapters_index ~= nil and chapter[1].book_cache_id ~= nil then
         chapter_down_tasks = chapter
     else
-
-        chapter_down_tasks = self:findNextChaptersNotDownLoad(chapter, download_chapter_count)
+        local down_count = tonumber(download_chapter_count)
+        down_count = (down_count and down_count > 1) and down_count or 1
+        chapter_down_tasks = self:findNextChaptersNotDownLoad(chapter, down_count)
     end
 
     if not H.is_tbl(chapter_down_tasks) or #chapter_down_tasks < 1 then
-        return false, 'No chapter to be downloaded'
+        return return_error_handle('No chapter to be downloaded')
     end
 
-    pcall(function()
-        Device:enableCPUCores(2)
-        UIManager:preventStandby()
-    end)
+    -- task mark
+    local task_pid_info = self:getLuaConfig(self.task_pid_file)
+    local write_to_pid_file =function(chapter)
+        task_pid_info:saveSetting("chapter", {
+            chapters_index = chapter.chapters_index,
+            book_cache_id = chapter.book_cache_id,
+            stime = os.time(),
+        }):flush()
+    end
 
-    self:closeDbManager()
-
-    local task_pid, err = self:launchProcess(function()
-
-        pcall(function()
-
-            util.writeToFile('', self.task_pid_file, true)
+    local end_task_clean = function(is_complete, exit_msg) 
+        local status, err = pcall(function()
+            task_pid_info:purge()
+            if util.fileExists(self.task_pid_file) then
+                util.removeFile(self.task_pid_file)
+            end
         end)
 
-        local task_return_db_add = self.dbManager:transaction(
-            function(book_cache_id, chapters_index, cache_file_path)
-                return self.dbManager:dynamicUpdateChapters({
-                    chapters_index = chapters_index,
-                    book_cache_id = book_cache_id
-                }, {
-                    content = 'downloaded',
-                    cacheFilePath = cache_file_path
-                })
-            end)
+        is_complete = is_complete and true or false
+        if has_result_progress_callback then
+            result_progress_callback(is_complete, exit_msg)
+        end
+    end
 
-        local task_return_db_clear = self.dbManager:transaction(
-            function(chapter_down_tasks, task_return_ok_list)
+    local process_task
+    local chapter_down_tasks_count = #chapter_down_tasks
 
-                for i = 1, #chapter_down_tasks do
-                    local nextChapter = chapter_down_tasks[i]
-                    if H.is_tbl(nextChapter) and nextChapter.chapters_index ~= nil and nextChapter.book_cache_id ~= nil then
+    -- Ensure the flow always reaches end_task_clean
+    process_task = function(dlChapter, index)
+        if not (H.is_num(index) and H.is_tbl(dlChapter) and dlChapter.chapters_index ~= nil and dlChapter.book_cache_id ~= nil) then
+                logger.err("error: next chapter data source")
+                return end_task_clean(false, "task 参数错误：".. index or "")
+        else
+                -- flag instead of direct download
+                dlChapter.is_pre_loading = true
+                write_to_pid_file(dlChapter)
 
-                        local chapters_index = tonumber(nextChapter.chapters_index)
-                        local book_cache_id = nextChapter.book_cache_id
+                logger.dbg('Threaded tasks running: chapter_title:', dlChapter.title or nil)
+                
+                self:launchProcess(function()
+                    return self:_pDownloadChapter(dlChapter)
+                end, function(status, downloaded_chapter, r2)
+                    if not (status and H.is_tbl(downloaded_chapter) and downloaded_chapter.cacheFilePath) then
+                        
+                        logger.err("Failed to download chapter or job execution error: ", downloaded_chapter, r2)
+                        -- Determine if the task should stop on error
+                        return end_task_clean(false, "下载错误, 意外终止：" .. tostring(downloaded_chapter))
+                    else
+                        local cache_file_path = downloaded_chapter.cacheFilePath
+                        local chapters_index = tonumber(dlChapter.chapters_index)
+                        local book_cache_id = dlChapter.book_cache_id
 
-                        if task_return_ok_list['ok_' .. chapters_index] == nil then
+                        logger.dbg('Download chapter successfully:', book_cache_id, chapters_index, cache_file_path)
 
-                            local status, err = pcall(function()
-                                self.dbManager:updateDownloadState({
-                                    chapters_index = chapters_index,
-                                    book_cache_id = book_cache_id
-                                }, false)
-                            end)
+                        local ok, err = pcall(function()
+                            return self.dbManager:updateCacheFilePath(dlChapter, cache_file_path)
+                        end)
+                        if not ok then
+                            logger.err('Error saving download to database, updateCacheFilePath:', tostring(err))
+                        end
 
-                            if not status then
-                                dbg.log("Error cleaning download task for database write:", H.errorHandler(err))
+                        if has_result_progress_callback then
+                            ok, err = pcall(result_progress_callback, index)
+                            if not ok then
+                                logger.err("result_progress_callback run error")
                             end
                         end
                     end
-                end
-            end)
 
-        local task_return_ok_list = {}
+                    logger.dbg("task info - index,tasks_count:", index, chapter_down_tasks_count)
 
-        ffiUtil.usleep(50)
-
-        for i = 1, #chapter_down_tasks do
-
-            ffiUtil.usleep(50)
-
-            local nextChapter = chapter_down_tasks[i]
-
-            if H.is_tbl(nextChapter) and nextChapter.chapters_index ~= nil and nextChapter.book_cache_id ~= nil then
-
-                nextChapter.is_pre_loading = true
-                dbg.v('Threaded tasks running:runInSubProcess_start_title:', nextChapter.title)
-
-                local status, err = pcall(function()
-                    return self:pDownloadChapter(nextChapter)
-                end)
-
-                if not status then
-                    logger.err("Chapter download failed: ", tostring(err))
-                else
-
-                    if H.is_tbl(err) and err.cacheFilePath then
-
-                        local cache_file_path = err.cacheFilePath
-                        local chapters_index = tonumber(nextChapter.chapters_index)
-                        local book_cache_id = nextChapter.book_cache_id
-
-                        task_return_ok_list['ok_' .. chapters_index] = true
-
-                        dbg.v('Download chapter successfully:', book_cache_id, chapters_index, cache_file_path)
-
-                        status, err = pcall(function()
-                            return task_return_db_add(book_cache_id, chapters_index, cache_file_path)
+                    if index < chapter_down_tasks_count then
+                        -- use event loop to avoid stack overflow
+                        UIManager:nextTick(function()
+                            index = index + 1
+                            local next_chapter = chapter_down_tasks[index]
+                            process_task(next_chapter, index)
                         end)
-                        if not status then
-                            logger.err('Error saving download to database:', tostring(err))
-                        end
+                    else
+                        logger.dbg("Legado.preLoadingChapters - END")
+                        return end_task_clean(true, "任务结束")
                     end
-
-                end
-            else
-                dbg.log("Cache error: next chapter data source")
-
+                end)
             end
-
-            if not util.fileExists(self.task_pid_file) then
-                dbg.v("Downloader received stop signal")
-                break
-            end
-
-        end
-
-        dbg.v("Clean up unfinished downloads")
-        local status, err = pcall(function()
-            return task_return_db_clear(chapter_down_tasks, task_return_ok_list)
-        end)
-        if not status and err then
-            dbg.v("Incomplete chapter cleanup after load", tostring(err))
-        end
-
-        self:closeDbManager()
-
-        chapter_down_tasks = nil
-        task_return_ok_list = nil
-
-        status, err = pcall(function()
-            util.removeFile(self.task_pid_file)
-            ffiUtil.usleep(50)
-            util.removeFile(self.task_pid_file)
-        end)
-
-        status, err = pcall(function()
-
-            Device:enableCPUCores(1)
-
-            UIManager:allowStandby()
-        end)
-        if not status and err then
-            dbg.v('allowStandby err', tostring(err))
-        end
-
-        return true
-
-    end)
-
-    if not task_pid then
-        dbg.log("Multithreaded task creation failed:" .. tostring(err))
-        pcall(function()
-            Device:enableCPUCores(1)
-            UIManager:allowStandby()
-        end)
-        return false, "Background download task failed" .. tostring(err)
-    else
-
-        dbg.v("Task started. PID:" .. tostring(task_pid))
-
-        local task_return_db_func = self.dbManager:transaction(
-            function(task_return_chapter, content)
-
-                self.dbManager:cleanDownloading()
-
-                for i = 1, #task_return_chapter do
-                    local task_chapter = task_return_chapter[i]
-                    if H.is_tbl(task_chapter) and task_chapter.chapters_index ~= nil and task_chapter.book_cache_id ~=
-                        nil then
-                        self.dbManager:updateDownloadState(task_chapter, content)
-                    end
-                end
-            end)
-
-        local status, err = pcall(function()
-
-            task_return_db_func(chapter_down_tasks, 'downloading_')
-        end)
-        if not status and err then
-            dbg.v("Download flag write error:", tostring(err))
-        end
-
-        return true, chapter_down_tasks
     end
 
+    local begin_chapter = chapter_down_tasks[1]
+    logger.dbg("Legado.preLoadingChapters - START")
+    process_task(begin_chapter, 1)
+    return true
 end
 
 function M:getChapterInfoCache(bookCacheId, chapterIndex)
@@ -2260,7 +2198,7 @@ function M:closeDbManager()
 end
 
 function M:cleanBookCache(book_cache_id)
-    if self:isExtractingInBackground() == true then
+    if self:getBackgroundTaskInfo() ~= false then
         return wrap_response(nil, '有后台任务进行中，请等待结束或者重启 KOReader')
     end
     local bookShelfId = self:getServerPathCode()
@@ -2279,7 +2217,7 @@ function M:cleanBookCache(book_cache_id)
 end
 
 function M:cleanAllBookCaches()
-    if self:isExtractingInBackground() == true then
+    if self:getBackgroundTaskInfo() ~= false then
         return wrap_response(nil, '有后台任务进行中，请等待结束或者重启 KOReader')
     end
 
@@ -2309,8 +2247,8 @@ function M:ChangeChapterCache(chapter)
 
     if isDownLoaded ~= true then
 
-        local status, err = self:preLoadingChapters({chapter}, 1)
-        if status == true then
+        local task_started, err = self:preLoadingChapters({chapter}, 1)
+        if task_started == true then
             return wrap_response(true)
         else
             return wrap_response(nil, '下载任务添加失败：' .. H.errorHandler(err))
@@ -2330,11 +2268,27 @@ function M:ChangeChapterCache(chapter)
                 cacheFilePath = '_NULL'
             })
         end)()
-        self:launchProcess(function()
-            self:refreshBookContent(chapter)
-        end)
+
+        self:refreshBookContentAsync(chapter)
         return wrap_response(true)
     end
+end
+
+function M:refreshBookContentAsync(chapter)
+    self:launchProcess(function()
+        self:refreshBookContent(chapter)
+    end)
+end
+
+function M:saveBookProgressAsync(chapter)
+    self:launchProcess(function()
+            return self:saveBookProgress(chapter)
+        end, function(status, response, r2)
+        if not (H.is_tbl(response) and response.type == 'SUCCESS') then
+            -- local message = type(response) == 'table' and response.message or "阅读进度自动上传失败"
+            self:_show_notice("自动进度上传失败")
+        end
+    end)
 end
 
 function M:runTaskWithRetry(taskFunc, timeoutMs, intervalMs)
@@ -2438,93 +2392,23 @@ function M:download_cover_img(book_cache_id, cover_url, cover_path_no_ext)
     end
 end
 
-function M:quit_the_background_download_job()
-
-    if util.fileExists(self.task_pid_file) then
-        util.removeFile(self.task_pid_file)
-    end
-    return true
-end
-
-function M:check_the_background_download_job(chapter_down_tasks)
-
-    if not H.is_tbl(chapter_down_tasks) or #chapter_down_tasks == 0 then
-        return wrap_response(true)
-    end
-
-    if not self:isExtractingInBackground() then
-        dbg.v("Inspector stopping...")
-        if #chapter_down_tasks ~= 1 then
-            return wrap_response(true)
-        else
-            return {
-                type = 'SUCCESS',
-                body = {
-                    message = '下载任务已经切换到后台'
-                }
-            }
-        end
-    end
-
-    local total_num = #chapter_down_tasks
-    local downloaded_num = 0
-
-    local target_ages = {}
-    local book_cache_id = chapter_down_tasks[1].book_cache_id
-
-    for i = 1, total_num do
-        local task_chapter = chapter_down_tasks[i]
-        if task_chapter and task_chapter.chapters_index ~= nil then
-            table.insert(target_ages, task_chapter.chapters_index)
-        end
-    end
-
-    local status, err = pcall(function()
-        return self.dbManager:getDownloadProgress(book_cache_id, target_ages)
-    end)
-
-    if status then
-        downloaded_num = tonumber(err)
-    end
-
-    dbg.v('Download progress num:', downloaded_num)
-    if downloaded_num == 0 then
-
-        return {
-            type = 'PENDING',
-            body = {
-                type = 'INITIALIZING',
-                total = total_num,
-                downloaded = downloaded_num
-            }
-        }
-    elseif downloaded_num < total_num then
-        return {
-            type = 'PENDING',
-            body = {
-                total = total_num,
-                downloaded = downloaded_num
-            }
-        }
-    else
-
-        return wrap_response(true)
-    end
-
-end
-
-function M:isExtractingInBackground(task_pid)
+function M:getBackgroundTaskInfo()
     -- ffiUtil.isSubProcessDone(task_pid)
     local pid_file = self.task_pid_file
     if not util.fileExists(pid_file) then
         return false
     end
-    if H.isFileOlderThan(pid_file, 24 * 60 * 60) then
-        util.removeFile(pid_file)
+    local task_pid_info = self:getLuaConfig(pid_file)
+    local task_chapter = task_pid_info:readSetting("chapter")
+    if not H.is_tbl(task_chapter) then
         return false
     end
-
-    return true
+    -- timeout
+    if task_chapter.stime and os.time() - task_chapter.stime > 7200 then
+        util.removeFile(pid_file)
+        return false
+    end 
+    return task_chapter
 end
 
 function M:after_reader_chapter_show(chapter)
@@ -2584,14 +2468,21 @@ function M:after_reader_chapter_show(chapter)
         end
     end
 
-    if chapter.isRead ~= true and NetworkMgr:isConnected() then
-        local complete_count = self:getcompleteReadAheadChapters(chapter)
-        if complete_count < 40 then
-            local preDownloadNum = 3
-            if chapter.cacheExt and chapter.cacheExt == 'cbz' then
-                preDownloadNum = 1
+    if NetworkMgr:isConnected() then
+        local settings = self:getSettings()
+        if settings.sync_reading == true then
+            UIManager:unschedule(M.saveBookProgressAsync)
+            UIManager:scheduleIn(8, M.saveBookProgressAsync, self, chapter)
+        end
+        if chapter.isRead ~= true then
+            local complete_count = self:getcompleteReadAheadChapters(chapter)
+            if complete_count < 40 then
+                local preDownloadNum = 3
+                if chapter.cacheExt and chapter.cacheExt == 'cbz' then
+                    preDownloadNum = 1
+                end
+                self:preLoadingChapters(chapter, preDownloadNum)
             end
-            self:preLoadingChapters(chapter, preDownloadNum)
         end
     end
 
@@ -2603,13 +2494,17 @@ function M:downloadChapter(chapter, message_dialog)
 
     local bookCacheId = chapter.book_cache_id
     local chapterIndex = chapter.chapters_index
+    local chapterName = chapter.name
 
-    if self.dbManager:isDownloading(bookCacheId, chapterIndex) == true and self:isExtractingInBackground() == true then
-        return wrap_response(nil, "此章节后台下载中, 请等待...")
+    local background_task_info = self:getBackgroundTaskInfo()
+    if H.is_tbl(background_task_info) and background_task_info.book_cache_id == bookCacheId and 
+            background_task_info.chapters_index == chapterIndex then
+            
+            return wrap_response(nil, "此章节后台下载中, 请等待...")
     end
 
     local status, err = pcall(function()
-        return self:pDownloadChapter(chapter, message_dialog)
+        return self:_pDownloadChapter(chapter, message_dialog)
     end)
     if not status then
         logger.err('下载章节失败：', err)
@@ -2718,6 +2613,107 @@ function M:setEndpointUrl(new_setting_url)
     return wrap_response(self.settings_data.data)
 end
 
+-- Multi-process execution: the job function call chain should not write to the database
+-- No need to use pcall for job, errors are already handled inside the function
+-- If a callback is provided, there will be no return value, as the callback will always be invoked
+function M:launchProcess(job, callback, timeout)
+    if not H.is_func(job) then
+        logger.err("launchProcess - job must be a function")
+        if H.is_func(callback) then
+            callback(false, "invalid_job_function")
+        else
+            return false, "invalid_job_function"
+        end
+    end
+
+    -- return task_pid, err other callback(ok, ...)
+    if not H.is_func(callback) then
+        return ffiUtil.runInSubProcess(job, nil, true)
+    end
+
+    local Trapper = require("ui/trapper")
+    local buffer = require("string.buffer")
+
+    Trapper:wrap(function()
+        pcall(function() Device:enableCPUCores(2) end)
+
+        logger.dbg("Legado.launchProcess - START")
+        local start_time = os.time()
+        local pid, parent_read_fd = nil, nil
+
+        local function deliver_result(ok, r1, r2)
+            if parent_read_fd then
+                pcall(ffiUtil.readAllFromFD, parent_read_fd)
+                parent_read_fd = nil
+            end
+            local status, err = pcall(function() Device:enableCPUCores(1) end)
+            if not status then
+                logger.err('Legado.launchProcess - Device.enableCPUCores err', tostring(err))
+            end
+            logger.dbg("Legado.launchProcess - END")
+            callback(ok, r1, r2)
+        end
+
+        pid, parent_read_fd = ffiUtil.runInSubProcess(function(_pid, child_write_fd)
+            local ok, r1, r2 = pcall(job)
+            local ret_tbl = { ok = ok, r1 = r1, r2 = r2 }
+            -- NOTE: LuaJIT's serializer currently doesn't support:
+            --       functions, coroutines, non-numerical FFI cdata & full userdata.
+            local output_str = ""
+            local ok, str = pcall(buffer.encode, ret_tbl)
+            if ok and str then
+                output_str = str
+            else
+                logger.warn("Legado.launchProcess - serialization failed:", str or "unknown error")
+                ret_tbl = { ok = false, r1 = "serialization_error", r2 = tostring(str)}
+                output_str = buffer.encode(ret_tbl) or ""
+            end
+            ffiUtil.writeToFD(child_write_fd, output_str, true)
+        end, true)
+
+        if not pid then
+            logger.dbg("Legado.launchProcess - background task failed to start")
+            deliver_result(false, "start_failed", parent_read_fd)
+            return
+        end
+
+        local function poll()
+            if timeout and os.difftime(os.time(), start_time) >= timeout then
+                logger.dbg("Legado.launchProcess - timeout reached, killing subprocess")
+                ffiUtil.terminateSubProcess(pid)
+                UIManager:scheduleIn(1, function()
+                   deliver_result(false, "timeout")
+                end)
+                return
+            end
+
+            local subprocess_done = ffiUtil.isSubProcessDone(pid)
+            local stuff_to_read = parent_read_fd and ffiUtil.getNonBlockingReadSize(parent_read_fd) ~= 0
+            if subprocess_done or stuff_to_read then
+               -- Subprocess is gone or nearly gone
+                local ok, r1, r2 = false, nil, nil
+                if parent_read_fd then
+                    local ret_str = ffiUtil.readAllFromFD(parent_read_fd) or ""
+                    local dec_ok, ret_tbl = pcall(buffer.decode, ret_str)
+                    if dec_ok and ret_tbl and type(ret_tbl) == "table" then
+                        ok, r1, r2 = ret_tbl.ok, ret_tbl.r1, ret_tbl.r2
+                    else
+                        logger.warn("Legado.launchProcess - malformed serialized data:", ret_tbl)
+                        ok, r1, r2 = false, "decode_error", nil
+                    end
+                    parent_read_fd = nil
+                end
+                logger.dbg("Legado.launchProcess - background task completed")
+                deliver_result(ok, r1, r2)
+            else
+                UIManager:scheduleIn(0.2, poll)
+            end
+        end
+
+        poll()
+    end)
+end
+
 function M:onExitClean()
     dbg.v('Backend call onExitClean')
 
@@ -2729,6 +2725,356 @@ function M:onExitClean()
     collectgarbage()
     collectgarbage()
     return true
+end
+
+function M:setCustomCSSPath(css_file_path)
+    if not H.is_str(css_file_path) or css_file_path == '' then
+        return wrap_response(nil, '参数校检错误，CSS文件路径不能为空')
+    end
+
+    if not util.fileExists(css_file_path) then
+        return wrap_response(nil, 'CSS文件不存在：' .. css_file_path)
+    end
+
+    -- 验证文件是否为CSS文件
+    local filename = css_file_path:lower()
+    if not filename:match("%.css$") then
+        return wrap_response(nil, '所选文件不是CSS文件')
+    end
+
+    local settings = self.settings_data.data
+    settings.custom_css_path = css_file_path
+    
+    return self:saveSettings(settings)
+end
+
+function M:getCustomCSSPath()
+    local settings = self:getSettings()
+    return settings.custom_css_path
+end
+
+function M:clearCustomCSSPath()
+    local settings = self.settings_data.data
+    settings.custom_css_path = nil
+    return self:saveSettings(settings)
+end
+
+function M:isCustomCSSEnabled()
+    local css_path = self:getCustomCSSPath()
+    return css_path and util.fileExists(css_path)
+end
+
+function M:validateCustomCSS()
+    local css_path = self:getCustomCSSPath()
+    if css_path and not util.fileExists(css_path) then
+        -- 如果设置了自定义CSS但文件不存在，则清除设置
+        logger.warn('自定义CSS文件不存在，自动清除设置：', css_path)
+        self:clearCustomCSSPath()
+        return false
+    end
+    return css_path and true or false
+end
+
+-- WEB配置管理方法
+function M:generateConfigId()
+    return tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+end
+
+function M:createWebConfig(name, url, description, server_type, username, password)
+    if not H.is_str(name) or name == '' then
+        return wrap_response(nil, '配置名称不能为空')
+    end
+    
+    if not H.is_str(url) or url == '' then
+        return wrap_response(nil, 'WEB地址不能为空')
+    end
+
+    -- 验证服务器类型
+    server_type = tonumber(server_type) or 1
+    if server_type < 1 or server_type > 3 then
+        return wrap_response(nil, '服务器类型必须是1、2或3')
+    end
+    
+    -- 如果是带认证服务(类型3)，验证用户名密码
+    if server_type == 3 then
+        if not H.is_str(username) or username == '' then
+            return wrap_response(nil, '带认证服务需要提供用户名')
+        end
+        if not H.is_str(password) or password == '' then
+            return wrap_response(nil, '带认证服务需要提供密码')
+        end
+    end
+
+    -- 验证URL格式
+    local parsed = socket_url.parse(url)
+    if not parsed then
+        return wrap_response(nil, 'WEB地址格式不正确')
+    end
+
+    if parsed.scheme ~= "http" and parsed.scheme ~= "https" then
+        return wrap_response(nil, '不支持的协议，请检查')
+    end
+
+    if not parsed.host or parsed.host == "" then
+        return wrap_response(nil, "没有主机名")
+    end
+
+    local config_id = self:generateConfigId()
+    local config = {
+        id = config_id,
+        name = name,
+        url = url,
+        description = description or "",
+        server_type = server_type,
+        server_address = url,
+        created_time = os.time(),
+        last_used = nil,
+        reader3_un = username or "",
+        reader3_pwd = password or ""
+    }
+
+    -- 根据服务器类型调整URL
+    if server_type == 2 and not url:match("/reader3$") then
+        -- 如果是服务器版本且URL不以/reader3结尾，自动添加
+        config.server_address = url .. (url:match("/$") and "reader3" or "/reader3")
+        config.url = config.server_address
+    elseif server_type == 3 and not url:match("/reader3$") then
+        -- 如果是带认证服务且URL不以/reader3结尾，自动添加
+        config.server_address = url .. (url:match("/$") and "reader3" or "/reader3")
+        config.url = config.server_address
+    end
+
+    -- 对于带认证服务，使用输入框提供的用户名密码，不从URL解析
+    -- 确保URL中不包含认证信息（清理URL）
+    if server_type == 3 and parsed.user then
+        -- 如果URL中包含认证信息，移除它们，使用输入框的值
+        parsed.user = nil
+        parsed.password = nil
+        config.url = socket_url.build(parsed)
+        config.server_address = config.url
+        if not config.server_address:match("/reader3$") then
+            config.server_address = config.server_address .. "/reader3"
+            config.url = config.server_address
+        end
+    end
+
+    local settings = self.settings_data.data
+    if not H.is_tbl(settings.web_configs) then
+        settings.web_configs = {}
+    end
+
+    -- 检查名称是否重复
+    for _, existing_config in ipairs(settings.web_configs) do
+        if existing_config.name == name then
+            return wrap_response(nil, '配置名称已存在')
+        end
+    end
+
+    table.insert(settings.web_configs, config)
+    return self:saveSettings(settings)
+end
+
+function M:getWebConfigs()
+    local settings = self:getSettings()
+    return settings.web_configs or {}
+end
+
+function M:getWebConfig(config_id)
+    local configs = self:getWebConfigs()
+    for _, config in ipairs(configs) do
+        if config.id == config_id then
+            return config
+        end
+    end
+    return nil
+end
+
+function M:updateWebConfig(config_id, name, url, description, server_type, username, password)
+    if not H.is_str(config_id) then
+        return wrap_response(nil, '配置ID无效')
+    end
+
+    local settings = self.settings_data.data
+    local configs = settings.web_configs or {}
+    local config_index = nil
+
+    for i, config in ipairs(configs) do
+        if config.id == config_id then
+            config_index = i
+            break
+        end
+    end
+
+    if not config_index then
+        return wrap_response(nil, '配置不存在')
+    end
+
+    -- 验证服务器类型
+    if server_type then
+        server_type = tonumber(server_type) or configs[config_index].server_type or 1
+        if server_type < 1 or server_type > 3 then
+            return wrap_response(nil, '服务器类型必须是1、2或3')
+        end
+        configs[config_index].server_type = server_type
+    end
+
+    -- 更新用户名和密码（用于带认证服务）
+    if H.is_str(username) then
+        configs[config_index].reader3_un = username
+    end
+    if H.is_str(password) then
+        configs[config_index].reader3_pwd = password
+    end
+
+    -- 如果是带认证服务(类型3)，验证用户名密码
+    if configs[config_index].server_type == 3 then
+        if not H.is_str(configs[config_index].reader3_un) or configs[config_index].reader3_un == '' then
+            return wrap_response(nil, '带认证服务需要提供用户名')
+        end
+        if not H.is_str(configs[config_index].reader3_pwd) or configs[config_index].reader3_pwd == '' then
+            return wrap_response(nil, '带认证服务需要提供密码')
+        end
+    end
+
+    -- 验证新的URL
+    if H.is_str(url) and url ~= '' then
+        local parsed = socket_url.parse(url)
+        if not parsed then
+            return wrap_response(nil, 'WEB地址格式不正确')
+        end
+        
+        -- 对于带认证服务，清理URL中的认证信息，使用输入框的值
+        if configs[config_index].server_type == 3 and parsed.user then
+            parsed.user = nil
+            parsed.password = nil
+            url = socket_url.build(parsed)
+        end
+        
+        configs[config_index].url = url
+        configs[config_index].server_address = url
+        
+        -- 根据服务器类型调整URL
+        if (configs[config_index].server_type == 2 or configs[config_index].server_type == 3) and not url:match("/reader3$") then
+            configs[config_index].server_address = url .. (url:match("/$") and "reader3" or "/reader3")
+            configs[config_index].url = configs[config_index].server_address
+        end
+    end
+
+    if H.is_str(name) and name ~= '' then
+        -- 检查名称是否与其他配置重复
+        for i, existing_config in ipairs(configs) do
+            if i ~= config_index and existing_config.name == name then
+                return wrap_response(nil, '配置名称已存在')
+            end
+        end
+        configs[config_index].name = name
+    end
+
+    if H.is_str(description) then
+        configs[config_index].description = description
+    end
+
+    settings.web_configs = configs
+    return self:saveSettings(settings)
+end
+
+function M:deleteWebConfig(config_id)
+    if not H.is_str(config_id) then
+        return wrap_response(nil, '配置ID无效')
+    end
+
+    local settings = self.settings_data.data
+    local configs = settings.web_configs or {}
+    
+    for i, config in ipairs(configs) do
+        if config.id == config_id then
+            table.remove(configs, i)
+            -- 如果删除的是当前配置，清除当前配置ID
+            if settings.current_config_id == config_id then
+                settings.current_config_id = nil
+            end
+            settings.web_configs = configs
+            return self:saveSettings(settings)
+        end
+    end
+
+    return wrap_response(nil, '配置不存在')
+end
+
+function M:switchWebConfig(config_id)
+    if not H.is_str(config_id) then
+        return wrap_response(nil, '配置ID无效')
+    end
+
+    local config = self:getWebConfig(config_id)
+    if not config then
+        return wrap_response(nil, '配置不存在')
+    end
+
+    local settings = self.settings_data.data
+    
+    -- 更新旧URL到历史记录（兼容旧功能）
+    local old_setting_url = settings.setting_url
+    if H.is_str(old_setting_url) and old_setting_url ~= '' then
+        local function updateHistoryItem(history_table, item, max_size)
+            for i = #history_table, 1, -1 do
+                if history_table[i] == item then
+                    table.remove(history_table, i)
+                    break
+                end
+            end
+            table.insert(history_table, item)
+            if max_size and max_size > 0 then
+                while #history_table > max_size do
+                    table.remove(history_table, 1)
+                end
+            end
+        end
+        if not H.is_tbl(settings.servers_history) then
+            settings.servers_history = {}
+        end
+        updateHistoryItem(settings.servers_history, old_setting_url, 10)
+    end
+
+    -- 切换到新配置
+    settings.server_address = config.server_address
+    settings.setting_url = config.url
+    settings.server_type = config.server_type
+    settings.reader3_un = config.reader3_un or ""
+    settings.reader3_pwd = config.reader3_pwd or ""
+    settings.current_config_id = config_id
+
+    -- 更新配置的最后使用时间
+    local configs = settings.web_configs or {}
+    for _, cfg in ipairs(configs) do
+        if cfg.id == config_id then
+            cfg.last_used = os.time()
+            break
+        end
+    end
+    settings.web_configs = configs
+
+    -- 计算新的MD5
+    local parsed = socket_url.parse(config.server_address)
+    if parsed and parsed.host then
+        settings.server_address_md5 = md5(parsed.host)
+    end
+
+    local result = self:saveSettings(settings)
+    if result.type == 'SUCCESS' then
+        self:loadSpore()
+        return wrap_response(self.settings_data.data)
+    else
+        return result
+    end
+end
+
+function M:getCurrentWebConfig()
+    local settings = self:getSettings()
+    if settings.current_config_id then
+        return self:getWebConfig(settings.current_config_id)
+    end
+    return nil
 end
 
 require("ffi/__gc")(M, {

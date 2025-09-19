@@ -91,13 +91,42 @@ local function split_title_advanced(title)
 end
 
 M.addCssRes = function(book_cache_id)
+    local Backend = require("Legado/Backend")
     local book_cache_path = H.getBookCachePath(book_cache_id)
     local book_css_path = string.format("%s/%s", book_cache_path, resCss)
 
     if not util.fileExists(book_css_path) then
-        H.copyFileFromTo(mianCss, book_css_path)
+        -- 检查是否启用了自定义CSS
+        if Backend:validateCustomCSS() then
+            local custom_css_path = Backend:getCustomCSSPath()
+            if util.fileExists(custom_css_path) then
+                H.copyFileFromTo(custom_css_path, book_css_path)
+                logger.info("使用自定义CSS：", custom_css_path)
+            else
+                logger.warn("自定义CSS文件不存在，使用默认CSS：", custom_css_path)
+                H.copyFileFromTo(mianCss, book_css_path)
+            end
+        else
+            -- 使用默认CSS
+            H.copyFileFromTo(mianCss, book_css_path)
+            logger.info("使用默认CSS：", mianCss)
+        end
     end
     return book_css_path
+end
+
+M.updateCssRes = function(book_cache_id)
+    local Backend = require("Legado/Backend")
+    local book_cache_path = H.getBookCachePath(book_cache_id)
+    local book_css_path = string.format("%s/%s", book_cache_path, resCss)
+
+    -- 删除现有CSS文件以强制更新
+    if util.fileExists(book_css_path) then
+        util.removeFile(book_css_path)
+    end
+
+    -- 重新创建CSS文件
+    return M.addCssRes(book_cache_id)
 end
 
 M.addchapterT = function(title, content)

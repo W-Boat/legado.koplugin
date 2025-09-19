@@ -37,6 +37,8 @@ return {
     FA_INFO = "\u{F129}",
     FA_LINK = "\u{F0C1}",
     FA_PENCIL = "\u{F303}",
+    FA_PAINT_BRUSH = "\u{F1FC}",
+    FA_PLUS = "\u{F067}",
     FA_SEARCH = "\u{F002}",
     FA_SHARE = "\u{F064}",
     FA_STAR = "\u{F005}",

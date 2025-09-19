@@ -33,7 +33,7 @@ local LibraryView = {
     book_menu = nil,
     -- file browser mode
     book_browser = nil,
-    book_browser_homedir = nil
+    book_browser_homedir = nil,
 }
 
 function LibraryView:init()
@@ -124,6 +124,384 @@ function LibraryView:closeMenu()
     end
 end
 
+function LibraryView:openWebConfigManager()
+    local configs = Backend:getWebConfigs()
+    local current_config = Backend:getCurrentWebConfig()
+    local current_config_id = current_config and current_config.id or nil
+
+    -- 创建配置列表的按钮
+    local config_buttons = {}
+    
+    -- 添加新增配置按钮
+    table.insert(config_buttons, {{
+        text = Icons.FA_PLUS .. " 新增配置",
+        callback = function()
+            self:openWebConfigTypeSelector()
+        end
+    }})
+
+    -- 如果有多个配置，添加快速切换按钮
+    if #configs > 1 then
+        table.insert(config_buttons, {{
+            text = Icons.FA_EXCHANGE .. " 快速切换",
+            callback = function()
+                self:openQuickConfigSwitch()
+            end
+        }})
+    end
+
+    -- 添加每个配置的按钮
+    for _, config in ipairs(configs) do
+        local is_current = (config.id == current_config_id)
+        local button_text = string.format("%s %s%s",
+            is_current and Icons.UNICODE_STAR or Icons.UNICODE_STAR_OUTLINE,
+            config.name,
+            is_current and " (当前)" or ""
+        )
+        
+        table.insert(config_buttons, {{
+            text = button_text,
+            callback = function()
+                self:openWebConfigMenu(config, is_current)
+            end
+        }})
+    end
+
+    -- 如果没有配置，显示提示和兼容旧配置的按钮
+    if #configs == 0 then
+        table.insert(config_buttons, {{
+            text = "暂无配置，点击上方新增",
+            enabled = false
+        }})
+        table.insert(config_buttons, {{
+            text = Icons.FA_GEAR .. " 旧版配置 (兼容)",
+            callback = function()
+                self:openInstalledReadSource()
+            end
+        }})
+    end
+
+    local dialog = require("ui/widget/buttondialog"):new{
+        title = "Legado WEB 配置管理",
+        title_align = "center",
+        buttons = config_buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function LibraryView:openQuickConfigSwitch()
+    local configs = Backend:getWebConfigs()
+    local current_config = Backend:getCurrentWebConfig()
+    local current_config_id = current_config and current_config.id or nil
+
+    local switch_buttons = {}
+    
+    for _, config in ipairs(configs) do
+        local is_current = (config.id == current_config_id)
+        local button_text = string.format("%s %s",
+            is_current and Icons.UNICODE_STAR or Icons.UNICODE_STAR_OUTLINE,
+            config.name
+        )
+        
+        table.insert(switch_buttons, {{
+            text = button_text,
+            enabled = not is_current,
+            callback = function()
+                if not is_current then
+                    Backend:HandleResponse(Backend:switchWebConfig(config.id), function(data)
+                        UIManager:close(dialog)  -- 关闭快速切换对话框
+                        MessageBox:notice(string.format("已切换到配置: %s", config.name))
+                        -- 刷新书架
+                        if self.book_menu then
+                            self.book_menu.item_table = self.book_menu:generateEmptyViewItemTable()
+                            self.book_menu.multilines_show_more_text = true
+                            self.book_menu.items_per_page = 1
+                            self.book_menu:updateItems()
+                            self.book_menu:onRefreshLibrary()
+                        end
+                    end, function(err_msg)
+                        MessageBox:error('切换失败：' .. err_msg)
+                    end)
+                end
+            end
+        }})
+    end
+
+    local dialog = require("ui/widget/buttondialog"):new{
+        title = string.format("当前: %s", current_config and current_config.name or "无"),
+        title_align = "center",
+        buttons = switch_buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function LibraryView:openWebConfigMenu(config, is_current)
+    local buttons = {{{
+        text = is_current and "当前配置" or "切换到此配置",
+        enabled = not is_current,
+        callback = function()
+            if not is_current then
+                Backend:HandleResponse(Backend:switchWebConfig(config.id), function(data)
+                    UIManager:close(dialog)  -- 关闭当前配置菜单对话框
+                    MessageBox:notice("配置切换成功")
+                    -- 刷新书架
+                    if self.book_menu then
+                        self.book_menu.item_table = self.book_menu:generateEmptyViewItemTable()
+                        self.book_menu.multilines_show_more_text = true
+                        self.book_menu.items_per_page = 1
+                        self.book_menu:updateItems()
+                        self.book_menu:onRefreshLibrary()
+                    end
+                end, function(err_msg)
+                    MessageBox:error('切换失败：', err_msg)
+                end)
+            end
+        end
+    }}, {{
+        text = "编辑配置",
+        callback = function()
+            UIManager:close(dialog)  -- 关闭当前配置菜单对话框
+            self:openWebConfigEditorWithType(config, config.server_type or 1)
+        end
+    }}, {{
+        text = "删除配置",
+        callback = function()
+            MessageBox:confirm(
+                string.format("确定要删除配置 \"%s\" 吗？", config.name),
+                function(result)
+                    if result then
+                        Backend:HandleResponse(Backend:deleteWebConfig(config.id), function(data)
+                            UIManager:close(dialog)  -- 关闭当前配置菜单对话框
+                            MessageBox:notice("配置删除成功")
+                            self:openWebConfigManager()
+                        end, function(err_msg)
+                            MessageBox:error('删除失败：', err_msg)
+                        end)
+                    end
+                end, {
+                    ok_text = "删除",
+                    cancel_text = "取消"
+                })
+        end
+    }}}
+
+    local info_text = string.format("名称：%s\nWEB地址：%s\n%s",
+        config.name,
+        config.url,
+        config.description ~= "" and ("描述：" .. config.description) or ""
+    )
+
+    local dialog = require("ui/widget/buttondialog"):new{
+        title = info_text,
+        title_align = "left",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function LibraryView:openWebConfigTypeSelector(config)
+    local is_edit = config ~= nil
+    local title = is_edit and "选择配置类型 (编辑)" or "选择配置类型 (新建)"
+    
+    local type_buttons = {{{
+        text = "手机APP",
+        callback = function()
+            UIManager:close(dialog)  -- 关闭类型选择对话框
+            self:openWebConfigEditorWithType(config, 1)
+        end
+    }}, {{
+        text = "服务器版（自动添加后缀）",
+        callback = function()
+            UIManager:close(dialog)  -- 关闭类型选择对话框
+            self:openWebConfigEditorWithType(config, 2)
+        end
+    }}, {{
+        text = "带认证服务（自动添加后缀）",
+        callback = function()
+            UIManager:close(dialog)  -- 关闭类型选择对话框
+            self:openWebConfigEditorWithType(config, 3)
+        end
+    }}}
+    
+    local dialog = require("ui/widget/buttondialog"):new{
+        title = title,
+        title_align = "center",
+        buttons = type_buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function LibraryView:openWebConfigEditorWithType(config, server_type)
+    local is_edit = config ~= nil
+    local type_names = {
+        [1] = "手机APP",
+        [2] = "服务器版", 
+        [3] = "带认证服务"
+    }
+    
+    local title = string.format("%s WEB 配置 - %s", 
+        is_edit and "编辑" or "新增", 
+        type_names[server_type] or "未知类型")
+    
+    local name_input = config and config.name or ""
+    local url_input = config and config.url or "http://"
+    local desc_input = config and config.description or ""
+    local username_input = config and config.reader3_un or ""
+    local password_input = config and config.reader3_pwd or ""
+    
+    -- 根据编辑模式获取当前类型，否则使用传入的类型
+    local current_type = is_edit and (config.server_type or 1) or server_type
+
+    -- 创建输入字段数组
+    local fields = {
+        {
+            text = name_input,
+            hint = "配置名称 (必填)",
+        },
+        {
+            text = url_input,
+            hint = self:getUrlHintByType(current_type),
+            input_type = "text",
+        },
+        {
+            text = desc_input,
+            hint = "描述 (可选)",
+        }
+    }
+    
+    -- 根据类型添加额外的输入框
+    if current_type == 3 then
+        table.insert(fields, {
+            text = username_input,
+            hint = "用户名 (必填)",
+        })
+        table.insert(fields, {
+            text = password_input,
+            hint = "密码 (必填)",
+            text_type = "password",
+        })
+    end
+
+    -- 创建输入字段的多输入对话框
+    local MultiInputDialog = require("ui/widget/multiinputdialog")
+    
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = title,
+        fields = fields,
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = is_edit and _("保存") or _("创建"),
+                    callback = function()
+                        self:handleConfigSave(dialog, config, current_type, is_edit)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function LibraryView:getUrlHintByType(server_type)
+    local hints = {
+        [1] = "手机APP地址 (如: http://127.0.0.1:1122)",
+        [2] = "服务器地址 (如: http://127.0.0.1:1122 - 会自动添加/reader3)",
+        [3] = "认证服务地址 (如: http://127.0.0.1:1122 - 会自动添加/reader3)"
+    }
+    return hints[server_type] or "WEB地址 (必填)"
+end
+
+function LibraryView:handleConfigSave(dialog, config, server_type, is_edit)
+    local fields = dialog:getFields()
+    local name = util.trim(fields[1] or "")
+    local url = util.trim(fields[2] or "")
+    local description = util.trim(fields[3] or "")
+    local username = ""
+    local password = ""
+    
+    -- 根据类型获取用户名密码
+    if server_type == 3 then
+        username = util.trim(fields[4] or "")
+        password = util.trim(fields[5] or "")
+    end
+
+    -- 验证必填字段
+    if name == "" then
+        MessageBox:notice("配置名称不能为空")
+        return
+    end
+
+    if url == "" then
+        MessageBox:notice("WEB地址不能为空")
+        return
+    end
+
+    -- 验证URL格式和主机名
+    local socket_url = require("socket.url")
+    local parsed = socket_url.parse(url)
+    if not parsed then
+        MessageBox:notice("WEB地址格式不正确")
+        return
+    end
+    
+    if not parsed.host or parsed.host == "" then
+        MessageBox:notice("请输入有效的主机名或IP地址")
+        return
+    end
+
+    -- 验证认证服务的用户名密码
+    if server_type == 3 then
+        if username == "" then
+            MessageBox:notice("带认证服务需要提供用户名")
+            return
+        end
+        if password == "" then
+            MessageBox:notice("带认证服务需要提供密码")
+            return
+        end
+    end
+    
+    -- 根据类型处理URL格式
+    url = self:formatUrlByType(url, server_type)
+
+    local operation
+    if is_edit then
+        operation = Backend:updateWebConfig(config.id, name, url, description, server_type, username, password)
+    else
+        operation = Backend:createWebConfig(name, url, description, server_type, username, password)
+    end
+
+    Backend:HandleResponse(operation, function(data)
+        UIManager:close(dialog)
+        MessageBox:notice(is_edit and "配置更新成功" or "配置创建成功")
+        self:openWebConfigManager()
+    end, function(err_msg)
+        MessageBox:error((is_edit and '更新失败：' or '创建失败：') .. err_msg)
+    end)
+end
+
+function LibraryView:formatUrlByType(url, server_type)
+    -- 移除末尾的斜杠
+    url = url:gsub("/$", "")
+    
+    if server_type == 2 or server_type == 3 then
+        -- 服务器版和带认证服务：如果URL不以/reader3结尾，自动添加
+        if not url:match("/reader3$") then
+            url = url .. "/reader3"
+        end
+    end
+    -- 类型1 (手机APP) 不需要特殊处理
+    
+    return url
+end
+
 function LibraryView:openInstalledReadSource()
 
     local setting_data = Backend:getSettings()
@@ -205,29 +583,7 @@ function LibraryView:openBrowserMenu(file)
     self:getInstance()
     self:getBrowserWidget()
     local dialog
-    local buttons = {{{
-        text = "清空书籍快捷方式",
-        callback = function()
-            UIManager:close(dialog)
-            MessageBox:confirm("是否清除所有书籍快捷方式?", function(result)
-                if result then
-                    local browser_homedir = self:getBrowserHomeDir(true)
-                    if self:deleteFile(browser_homedir) then
-                        MessageBox:notice("已清除")
-                    end
-                end
-            end, {
-                ok_text = "清除",
-                cancel_text = "取消"
-            })
-        end
-    }}, {{
-        text = "修复书籍快捷方式",
-        callback = function()
-            UIManager:close(dialog)
-            self.book_browser:verifyBooksMetadata()
-        end
-    }}, {{
+    local buttons = { {{
         text = "更换书籍封面",
         callback = function()
             local ui = FileManager.instance or ReaderUI.instance
@@ -257,37 +613,110 @@ function LibraryView:openBrowserMenu(file)
                 MessageBox:notice("操作失败: 仅能在文件浏览器下操作")
             end
         end
-    }}, {{
+    }, {
         text = "更多设置",
         callback = function()
             UIManager:close(dialog)
-            self:openMenu()
+            UIManager:nextTick(function()
+                self:openMenu()
+            end)
         end
-    }}}
+    }}, {{
+        text = "清空书籍快捷方式",
+        callback = function()
+            UIManager:close(dialog)
+            MessageBox:confirm("是否清除所有书籍快捷方式?", function(result)
+                if result then
+                    local browser_homedir = self:getBrowserHomeDir(true)
+                    if self:deleteFile(browser_homedir) then
+                        MessageBox:notice("已清除")
+                    end
+                end
+            end, {
+                ok_text = "清除",
+                cancel_text = "取消"
+            })
+        end
+    }}, {{
+        text = "修复书籍快捷方式",
+        callback = function()
+            UIManager:close(dialog)
+            self.book_browser:verifyBooksMetadata()
+        end
+    }},}
 
     dialog = require("ui/widget/buttondialog"):new{
         title = "Legado 设置",
         title_align = "center",
         title_face = Font:getFace("x_smalltfont"),
         info_face = Font:getFace("tfont"),
-        buttons = buttons
+        buttons = buttons,
     }
 
     UIManager:show(dialog)
 end
 
-function LibraryView:openMenu()
+function LibraryView:selectCustomCSS()
+    local PathChooser = require("ui/widget/pathchooser")
+    UIManager:show(PathChooser:new{
+        title = _("选择自定义CSS文件"),
+        select_directory = false,
+        select_file = true,
+        show_files = true,
+        path = H.getHomeDir(),
+        file_filter = function(filename)
+            return filename:match("%.css$")  -- 只显示CSS文件
+        end,
+        onConfirm = function(file_path)
+            Backend:HandleResponse(Backend:setCustomCSSPath(file_path), function(data)
+                MessageBox:notice("自定义CSS设置成功")
+                -- 更新所有书籍的CSS缓存
+                self:updateAllBookCSS()
+            end, function(err_msg)
+                MessageBox:error('设置失败：', err_msg)
+            end)
+        end,
+    })
+end
+
+function LibraryView:updateAllBookCSS()
+    -- 获取所有书籍并更新其CSS
+    local EpubHelper = require("Legado/EpubHelper")
+    UIManager:nextTick(function()
+        MessageBox:loading("更新样式中...", function()
+            local bookinfos = Backend:getBookShelfCache()
+            if H.is_tbl(bookinfos) then
+                for _, bookinfo in ipairs(bookinfos) do
+                    if bookinfo.cache_id then
+                        EpubHelper.updateCssRes(bookinfo.cache_id)
+                    end
+                end
+            end
+            return true
+        end, function(state, response)
+            if state then
+                MessageBox:notice("样式更新完成")
+            else
+                MessageBox:error("样式更新失败")
+            end
+        end)
+    end)
+end
+
+function LibraryView:openMenu(dimen)
     local dialog
     self:getInstance()
+    local unified_align = dimen and "left" or "center"
     local settings = Backend:getSettings()
-    local buttons = {{{
-        text = Icons.FA_GLOBE .. " Legado WEB地址",
+    local buttons = {{},{{
+        text = Icons.FA_GLOBE .. " Legado WEB 配置",
         callback = function()
             UIManager:close(dialog)
-            self:openInstalledReadSource()
-        end
+            self:openWebConfigManager()
+        end,
+        align = unified_align,
     }}, {{
-        text = string.format("%s 流式漫画模式 %s", Icons.FA_BOOK,
+        text = string.format("%s 流式漫画模式  %s", Icons.FA_BOOK,
             (settings.stream_image_view and Icons.UNICODE_STAR or Icons.UNICODE_STAR_OUTLINE)),
         callback = function()
             UIManager:close(dialog)
@@ -307,9 +736,27 @@ function LibraryView:openMenu()
                 ok_text = "切换",
                 cancel_text = "取消"
             })
-        end
+        end,
+        align = unified_align,
     }}, {{
-        text = string.format("%s 自动生成快捷方式 %s", Icons.FA_FOLDER,
+        text = string.format("%s 自动上传阅读进度  %s", Icons.FA_CLOUD,
+            (settings.sync_reading and Icons.UNICODE_STAR or Icons.UNICODE_STAR_OUTLINE)),
+        callback = function()
+            UIManager:close(dialog)
+            local ok_msg = "设置已开启"
+            if settings.sync_reading then
+                    ok_msg = "设置已关闭"
+            end
+            settings.sync_reading = not settings.sync_reading or nil
+            Backend:HandleResponse(Backend:saveSettings(settings), function(data)
+                MessageBox:notice(ok_msg)
+            end, function(err_msg)
+                MessageBox:error('设置失败:', err_msg)
+            end)
+        end,
+        align = unified_align,
+    }}, {{
+        text = string.format("%s 自动生成快捷方式  %s", Icons.FA_FOLDER,
             (settings.disable_browser and Icons.UNICODE_STAR_OUTLINE or Icons.UNICODE_STAR)),
         callback = function()
             UIManager:close(dialog)
@@ -318,10 +765,10 @@ function LibraryView:openMenu()
                 (settings.disable_browser and '[关闭]' or '[开启]')), function(result)
                 if result then
                     local ok_msg = "设置已开启"
-                    settings.disable_browser = not settings.disable_browser or nil
-                    if settings.disable_browser then
+                    if not settings.disable_browser then
                         ok_msg = "设置已关闭，请手动删除目录"
                     end
+                    settings.disable_browser = not settings.disable_browser or nil
                     Backend:HandleResponse(Backend:saveSettings(settings), function(data)
                         MessageBox:notice(ok_msg)
                     end, function(err_msg)
@@ -332,9 +779,51 @@ function LibraryView:openMenu()
                 ok_text = "切换",
                 cancel_text = "取消"
             })
-        end
+        end,
+        align = unified_align,
     }}, {{
-        text = string.format("%s Clear all caches", Icons.FA_TIMES),
+        text = string.format("%s 自定义CSS样式  %s", Icons.FA_PAINT_BRUSH,
+            (Backend:isCustomCSSEnabled() and Icons.UNICODE_STAR or Icons.UNICODE_STAR_OUTLINE)),
+        callback = function()
+            UIManager:close(dialog)
+            local current_css = Backend:getCustomCSSPath()
+            local dialog_buttons = {{{
+                text = "选择CSS文件",
+                callback = function()
+                    self:selectCustomCSS()
+                end
+            }}}
+            
+            if current_css then
+                table.insert(dialog_buttons, {{
+                    text = "移除自定义CSS",
+                    callback = function()
+                        Backend:HandleResponse(Backend:clearCustomCSSPath(), function(data)
+                            MessageBox:notice("已恢复默认CSS样式")
+                            self:updateAllBookCSS()
+                        end, function(err_msg)
+                            MessageBox:error('操作失败：', err_msg)
+                        end)
+                    end
+                }})
+                table.insert(dialog_buttons, {{
+                    text = "重新应用CSS",
+                    callback = function()
+                        self:updateAllBookCSS()
+                    end
+                }})
+            end
+            
+            local css_dialog = require("ui/widget/buttondialog"):new{
+                title = string.format("当前CSS：%s", current_css and "自定义" or "默认"),
+                title_align = "center",
+                buttons = dialog_buttons,
+            }
+            UIManager:show(css_dialog)
+        end,
+        align = unified_align,
+    }}, {{
+        text = string.format("%s Clear all caches", Icons.FA_TRASH),
         callback = function()
             UIManager:close(dialog)
             MessageBox:confirm(
@@ -361,7 +850,8 @@ function LibraryView:openMenu()
                     ok_text = "清空",
                     cancel_text = "取消"
                 })
-        end
+        end,
+        align = unified_align,
     }}, {{
         text = Icons.FA_QUESTION_CIRCLE .. ' ' .. "关于/更新",
         callback = function()
@@ -393,16 +883,18 @@ function LibraryView:openMenu()
             UIManager:nextTick(function()
                 Backend:checkOta(true)
             end)
-        end
+        end,
+        align = unified_align,
     }}}
 
     if not Device:isTouchDevice() then
-        table.insert(buttons, 4, {{
-            text = Icons.FA_EXCLAMATION_CIRCLE .. ' ' .. " 同步书架",
+        table.insert(buttons, #buttons, {{
+            text = Icons.FA_REFRESH .. ' ' .. " 同步书架",
             callback = function()
                 UIManager:close(dialog)
                 self:onRefreshLibrary()
-            end
+            end,
+            align = unified_align,
         }})
     end
 
@@ -415,11 +907,15 @@ function LibraryView:openMenu()
     end
 
     dialog = require("ui/widget/buttondialog"):new{
-        title = string.format(Icons.FA_DATABASE .. " 剩余空间: %.1f G", self.disk_available or -1),
-        title_align = "center",
+        title = string.format(Icons.FA_DATABASE .. " Free: %.1f G", self.disk_available or -1),
+        title_align = unified_align,
         title_face = Font:getFace("x_smalltfont"),
         info_face = Font:getFace("tfont"),
-        buttons = buttons
+        buttons = buttons,
+        shrink_unneeded_width = dimen and true,
+        anchor = dimen and function()
+            return dimen
+        end or nil,
     }
 
     UIManager:show(dialog)
@@ -435,7 +931,7 @@ end
 -- readerUI -> ReturnLegadoChapterListing event -> show ChapterListing -> close ->show LibraryView ->close -> ? 
 function LibraryView:openLegadoFolder(path, focused_file, selected_files, done_callback)
     UIManager:nextTick(function()
-        if ReaderUI.instance then
+        if ReaderUI and ReaderUI.instance then
             ReaderUI.instance:onClose()
             self.readerui_is_showing = false
         end
@@ -451,6 +947,10 @@ function LibraryView:openLegadoFolder(path, focused_file, selected_files, done_c
             done_callback()
         end
     end)
+end
+
+function LibraryView:afterCloseReaderUi(callback)
+    self:openLegadoFolder(nil, nil, nil, callback)
 end
 
 function LibraryView:loadAndRenderChapter(chapter)
@@ -472,7 +972,7 @@ function LibraryView:loadAndRenderChapter(chapter)
                     end
                     self:showReaderUI(data)
                 end, function(err_msg)
-                    Backend:show_notice("请检查并刷新书架")
+                    MessageBox:notice("请检查并刷新书架")
                     MessageBox:error(err_msg or '错误')
                 end)
             end
@@ -495,15 +995,17 @@ function LibraryView:ReaderUIEventCallback(chapter_call_event)
         book_cache_id = chapter.book_cache_id,
         totalChapterNum = chapter.totalChapterNum
     })
-
+ 
     if H.is_tbl(nextChapter) then
         nextChapter.call_event = chapter.call_event
         self:loadAndRenderChapter(nextChapter)
     else
-        self:openLegadoFolder(nil, nil, nil, function()
-            if self.book_toc then
-                UIManager:show(self.book_toc)
-            end
+        local bookinfo = (self.book_toc and H.is_tbl(self.book_toc.bookinfo)) 
+            and self.book_toc.bookinfo 
+            or Backend:getBookInfoCache(chapter.book_cache_id)
+
+        self:afterCloseReaderUi(function()
+            self:showBookTocDialog(bookinfo)
         end)
     end
 end
@@ -512,12 +1014,13 @@ function LibraryView:showReaderUI(chapter)
     if not (H.is_tbl(chapter) and H.is_str(chapter.cacheFilePath)) then
         return
     end
-    self.displayed_chapter = chapter
     local book_path = chapter.cacheFilePath
     if not util.fileExists(book_path) then
         return MessageBox:error(book_path, "不存在")
     end
-    if self.book_toc then
+    self.displayed_chapter = chapter
+
+    if self.book_toc and UIManager:isWidgetShown(self.book_toc) then
         UIManager:close(self.book_toc)
     end
     if ReaderUI.instance then
@@ -526,7 +1029,40 @@ function LibraryView:showReaderUI(chapter)
         UIManager:broadcastEvent(Event:new("SetupShowReader"))
         ReaderUI:showReader(book_path, nil, true)
     end
-    Backend:after_reader_chapter_show(chapter)
+    UIManager:nextTick(function()
+        Backend:after_reader_chapter_show(chapter)
+    end)
+end
+
+function LibraryView:openLastReadChapter(bookinfo)
+    if not (H.is_tbl(bookinfo) and bookinfo.cache_id) then
+        logger.err("openLastReadChapter parameter error")
+        return false
+    end
+
+    local book_cache_id = bookinfo.cache_id
+    local last_read_chapter = Backend:getLastReadChapter(book_cache_id)
+    -- default 0
+    if H.is_num(last_read_chapter) then
+
+        local chapters_index = last_read_chapter - 1
+        if chapters_index < 0 then
+            chapters_index = 0
+        end
+
+        local chapter = Backend:getChapterInfoCache(book_cache_id, chapters_index)
+        if H.is_tbl(chapter) and chapter.chapters_index then
+            -- jump to the reading position
+            chapter.call_event = "next"
+            self:loadAndRenderChapter(chapter)
+        else
+            -- chapter does not exist, request refresh
+            self:showBookTocDialog(bookinfo)
+            MessageBox:notice('请同步刷新目录数据')
+        end
+        
+        return true
+    end 
 end
 
 function LibraryView:initializeRegisterEvent(parent_ref)
@@ -568,82 +1104,76 @@ function LibraryView:initializeRegisterEvent(parent_ref)
         return true
     end
 
-    function parent_ref:openLastReadChapter(book_cache_id)
-        library_view_ref:getInstance()
-        if not library_view_ref.instance then
-            logger.warn("openLastReadChapter LibraryView instance not loaded")
-            return
+    function parent_ref:_loadBookFromManager(file, undoFileOpen)
+
+        local loading_msg = MessageBox:info("前往最近阅读章节...", 3)
+
+        -- prioritize using custom matedata book_cache_id
+        local doc_settings = DocSettings:open(file)
+        local book_cache_id = doc_settings:readSetting("book_cache_id")
+
+        if not book_cache_id then
+            local ok, lnk_config = pcall(Backend.getLuaConfig, Backend, file)
+            if ok and lnk_config then
+                book_cache_id = lnk_config:readSetting("book_cache_id")
+            end
         end
+
+        -- unrecognized file
         if not H.is_str(book_cache_id) then
-            MessageBox:notice("openLastReadChapter parameter error")
+            UIManager:close(loading_msg)
+            return undoFileOpen and undoFileOpen(file)
+        end
+
+        library_view_ref:getInstance()
+        local library_view_instance = library_view_ref.instance
+
+        if not library_view_instance then
+            logger.warn("oadLastReadChapter LibraryView instance not loaded")
+            UIManager:close(loading_msg)
+            MessageBox:error("加载书架失败")
             return
         end
-        local last_read_chapter = Backend:getLastReadChapter(book_cache_id)
-        if H.is_num(last_read_chapter) then
-            local bookinfo = Backend:getBookInfoCache(book_cache_id)
-            if not (H.is_tbl(bookinfo) and H.is_num(bookinfo.durChapterIndex)) then
-                -- no sync
-                self:onShowLegadoLibraryView()
-                MessageBox:notice("书籍不存在于书架,请刷新同步")
-                return
-            end
 
-            local book_toc_instance = library_view_ref.instance.book_toc
-            if not (book_toc_instance and H.is_tbl(book_toc_instance.bookinfo) and book_toc_instance.bookinfo.cache_id ==
-                book_cache_id) then
-                library_view_ref.instance.book_toc = ChapterListing:fetchAndShow({
-                    cache_id = bookinfo.cache_id,
-                    bookUrl = bookinfo.bookUrl,
-                    durChapterIndex = bookinfo.durChapterIndex,
-                    name = bookinfo.name,
-                    author = bookinfo.author,
-                    cacheExt = bookinfo.cacheExt,
-                    origin = bookinfo.origin,
-                    originName = bookinfo.originName,
-                    originOrder = bookinfo.originOrder
-                }, function()
-                end, function(chapter)
-                    library_view_ref.instance:loadAndRenderChapter(chapter)
-                end, true, true)
-            end
-
-            local chapters_index = last_read_chapter - 1
-            if chapters_index < 0 then
-                chapters_index = 0
-            end
-            local chapter = Backend:getChapterInfoCache(book_cache_id, chapters_index)
-            if H.is_tbl(chapter) and chapter.chapters_index then
-                -- jump to the reading position
-                chapter.call_event = "next"
-                library_view_ref.instance:loadAndRenderChapter(chapter)
-            else
-                -- chapter does not exist, request refresh
-                if library_view_ref.instance.book_toc then
-                    UIManager:show(library_view_ref.instance.book_toc)
-                end
-                MessageBox:notice('请同步刷新目录数据')
-            end
-            return true
+        local bookinfo = Backend:getBookInfoCache(book_cache_id)
+        if not (H.is_tbl(bookinfo) and H.is_num(bookinfo.durChapterIndex)) then
+            UIManager:close(loading_msg)
+            -- no sync
+            self:onShowLegadoLibraryView()
+            MessageBox:notice("书籍不存在于书架,请刷新同步")
+            return
         end
 
-        local dir = library_view_ref.instance:getBrowserHomeDir()
-        self:onShowLegadoToc(book_cache_id, function()
+        local onReturnCallBack = function()
+            -- local dir = library_view_instance:getBrowserHomeDir()
             -- Sometimes LibraryView instance may not start
-            library_view_ref:openLegadoFolder(dir)
-        end)
+            -- library_view_ref:openLegadoFolder(dir)
+        end
+
+        library_view_instance:refreshBookTocWidget(bookinfo, onReturnCallBack)
+        library_view_instance.selectetrued_item = {cache_id = book_cache_id}
+
+        library_view_instance:openLastReadChapter(bookinfo)
+        UIManager:close(loading_msg)
+        return true
     end
 
-    function parent_ref:onShowLegadoToc(book_cache_id, onReturnCallBack)
+    function parent_ref:onShowLegadoToc(book_cache_id)
         library_view_ref:getInstance()
-        if not library_view_ref.instance then
+        local library_view_instance = library_view_ref.instance
+
+        if not library_view_instance then
             logger.warn("ShowLegadoToc LibraryView instance not loaded")
             return true
         end
         if not book_cache_id then
-            if library_view_ref.instance.displayed_chapter then
-                book_cache_id = library_view_ref.instance.displayed_chapter.book_cache_id
-            elseif library_view_ref.instance.selected_item then
-                book_cache_id = library_view_ref.instance.selected_item.cache_id
+            if library_view_instance.displayed_chapter then
+                book_cache_id = library_view_instance.displayed_chapter.book_cache_id
+            elseif library_view_instance.book_toc and 
+                    library_view_instance.book_toc.bookinfo then
+                book_cache_id = library_view_instance.book_toc.bookinfo.cache_id
+            elseif library_view_instance.selected_item then
+                book_cache_id = library_view_instance.selected_item.cache_id
             end
         end
         if not book_cache_id then
@@ -657,35 +1187,7 @@ function LibraryView:initializeRegisterEvent(parent_ref)
             return
         end
 
-        if not H.is_func(onReturnCallBack) then
-            onReturnCallBack = function()
-                self:openLibraryView()
-            end
-        end
-
-        local fetch_show_chapter = function()
-            library_view_ref.instance.book_toc = ChapterListing:fetchAndShow({
-                cache_id = bookinfo.cache_id,
-                bookUrl = bookinfo.bookUrl,
-                durChapterIndex = bookinfo.durChapterIndex,
-                name = bookinfo.name,
-                author = bookinfo.author,
-                cacheExt = bookinfo.cacheExt,
-                origin = bookinfo.origin,
-                originName = bookinfo.originName,
-                originOrder = bookinfo.originOrder
-            }, onReturnCallBack, function(chapter)
-                library_view_ref.instance:loadAndRenderChapter(chapter)
-            end, true)
-        end
-
-        -- If under ReaderUI, exit it first.
-        local ReaderUI = require("apps/reader/readerui")
-        if ReaderUI and ReaderUI.instance then
-            library_view_ref:openLegadoFolder(nil, nil, nil, fetch_show_chapter)
-        else
-            fetch_show_chapter()
-        end
+        library_view_instance:showBookTocDialog(bookinfo)
         return true
     end
 
@@ -938,27 +1440,13 @@ function LibraryView:initializeRegisterEvent(parent_ref)
             open_regular_file(file)
             return
         end
-        -- prioritize using custom matedata book_cache_id
-        local doc_settings = DocSettings:open(file)
-        local book_cache_id = doc_settings:readSetting("book_cache_id")
-
-        if not book_cache_id then
-            local ok, lnk_config = pcall(Backend.getLuaConfig, Backend, file)
-            if ok and lnk_config then
-                book_cache_id = lnk_config:readSetting("book_cache_id")
-            end
+        local ok, err = pcall(function() 
+            self:_loadBookFromManager(file, open_regular_file)
+        end)
+        if not ok then
+            logger.err("fail to open file:", err)
         end
-        if book_cache_id then
-            local ok, err = pcall(function()
-                return self:openLastReadChapter(book_cache_id)
-            end)
-            if not ok then
-                logger.err("fail to open file:", err)
-            end
-            return true
-        else
-            open_regular_file(file)
-        end
+        return true
     end
 end
 
@@ -1180,31 +1668,43 @@ local function init_book_menu(parent)
     end
     local book_menu = Menu:new{
         name = "library_view",
-        is_enable_shortcut = false,
-        is_popout = false,
+        -- is_enable_shortcut = false,
         title = "书架",
         with_context_menu = true,
         align_baselines = true,
-        covers_fullscreen = true,
+        covers_fullscreen = true, -- hint for UIManager:_repaint()
+        is_borderless = true,
         title_bar_left_icon = "appbar.menu",
+        title_bar_fm_style = true,
         width = Device.screen:getWidth(),
         height = Device.screen:getHeight(),
-        onLeftButtonTap = function()
-            parent:openMenu()
-        end,
         close_callback = function()
             Backend:closeDbManager()
         end,
         show_search_item = nil,
-        parent_ref = parent
+        refresh_menu_key = nil,
+        parent_ref = parent,
     }
 
-    if Device:hasKeys({"Home"}) or Device:hasDPad() then
-        book_menu.key_events.Close = {{Device.input.group.Back}}
-        book_menu.key_events.RefreshLibrary = {{"Home"}}
-        book_menu.key_events.FocusRight = {{"Right"}}
+    if Device:hasKeys() then
+        book_menu.refresh_menu_key = "Home"
+        if Device:hasKeyboard() then
+            book_menu.refresh_menu_key = "F5"
+        end
+        book_menu.key_events.RefreshChapters = { { book_menu.refresh_menu_key } }
+    end
+    if Device:hasDPad() then
+        book_menu.key_events.FocusRight = {{ "Right" }}
+        book_menu.key_events.Right = nil
     end
 
+    function book_menu:onLeftButtonTap()
+        local dimen
+        if self.title_bar and self.title_bar.left_button and self.title_bar.left_button.image then
+            dimen = self.title_bar.left_button.image.dimen
+        end
+        parent:openMenu(dimen)
+    end
     function book_menu:onFocusRight()
         local focused_widget = Menu.getFocusItem(self)
         if focused_widget then
@@ -1253,30 +1753,31 @@ local function init_book_menu(parent)
             end)
             return
         end
+        
         local bookinfo = Backend:getBookInfoCache(item.cache_id)
         self.parent_ref.selected_item = item
-        self.parent_ref.onReturnCallback = function()
+
+        if not (H.is_tbl(bookinfo) and bookinfo.cache_id) then
+            return MessageBox:error("书籍信息查询出错")
+        end
+
+        local onReturnCallBack = function()
             self:show_view()
             self:refreshItems(true)
         end
-        self.parent_ref.book_toc = ChapterListing:fetchAndShow({
-            cache_id = bookinfo.cache_id,
-            bookUrl = bookinfo.bookUrl,
-            durChapterIndex = bookinfo.durChapterIndex,
-            name = bookinfo.name,
-            author = bookinfo.author,
-            cacheExt = bookinfo.cacheExt,
-            origin = bookinfo.origin,
-            originName = bookinfo.originName,
-            originOrder = bookinfo.originOrder
-        }, self.parent_ref.onReturnCallback, function(chapter)
-            self.parent_ref.instance:loadAndRenderChapter(chapter)
-        end, true)
+
+        local update_toc_visibility = function()
+            self.parent_ref:refreshBookTocWidget(bookinfo, onReturnCallBack, true)
+        end
+
+        update_toc_visibility()
+        self:onClose()
+        --self.parent_ref:openLastReadChapter(bookinfo, on_return_callback)
+        
         UIManager:nextTick(function()
             Backend:autoPinToTop(bookinfo.cache_id, bookinfo.sortOrder)
             self.parent_ref:addBkShortcut(bookinfo)
         end)
-        self:onClose()
     end
 
     function book_menu:onRefreshLibrary()
@@ -1386,14 +1887,17 @@ local function init_book_menu(parent)
         else
             self:onPrimaryMenuChoice(entry, pos)
         end
+        return true
     end
 
     function book_menu:generateEmptyViewItemTable()
+        local hint = (self.refresh_menu_key and not Device:isTouchDevice())
+            and string.format("press the %s button", self.refresh_menu_key)
+            or "swiping down"
         return {{
-            text = string.format("No books found in library. Try%s swiping down to refresh.",
-                (Device:hasKeys({"Home"}) and ' Press the home button or ' or '')),
+            text = string.format("No books found. Try %s to refresh.", hint),
             dim = true,
-            select_enabled = false
+            select_enabled = false,
         }}
     end
 
@@ -1504,6 +2008,52 @@ end
 
 function LibraryView:getMenuWidget()
     return init_book_menu(self)
+end
+
+function LibraryView:refreshBookTocWidget(bookinfo, onReturnCallBack, visible)
+    if not (H.is_tbl(bookinfo) and bookinfo.cache_id) then
+        logger.err("refreshBookTocWidget parameter error")
+        return self.book_toc
+    end
+
+    local book_cache_id = bookinfo.cache_id
+
+    local toc_instance = self.book_toc
+    if not (H.is_tbl(toc_instance) and H.is_tbl(toc_instance.bookinfo) and 
+            toc_instance.bookinfo.cache_id == book_cache_id) then
+            logger.dbg("add new book_toc widget")
+
+            self.book_toc = ChapterListing:fetchAndShow({
+                cache_id = bookinfo.cache_id,
+                bookUrl = bookinfo.bookUrl,
+                durChapterIndex = bookinfo.durChapterIndex,
+                name = bookinfo.name,
+                author = bookinfo.author,
+                cacheExt = bookinfo.cacheExt,
+                origin = bookinfo.origin,
+                originName = bookinfo.originName,
+                originOrder = bookinfo.originOrder
+
+            }, onReturnCallBack, function(chapter)
+                    self:loadAndRenderChapter(chapter)
+            end, true, visible)
+
+    else
+        logger.dbg("update book_toc widget ReturnCallback")
+        self.book_toc:updateReturnCallback(onReturnCallBack)
+
+        if visible == true then
+            self.book_toc:refreshItems()
+            UIManager:show(self.book_toc)
+        end
+    end
+
+    return self.book_toc
+end
+
+function LibraryView:showBookTocDialog(bookinfo)
+    -- Simple display should not cause changes onReturnCallBack
+    return self:refreshBookTocWidget(bookinfo, nil, true)
 end
 
 return LibraryView
